@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from sklearn.compose import ColumnTransformer
+from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
@@ -79,6 +80,22 @@ def train_models(df):
         pipe.fit(X_train, y_train)
 
         pred = pipe.predict(X_test)
+
+        # Permutation importance on the TEST set, per original input feature
+        perm = permutation_importance(
+            pipe, X_test, y_test, scoring="f1_macro",
+            n_repeats=20, random_state=42, n_jobs=1,
+        )
+        importance = (
+            pd.DataFrame(
+                {"Feature": X_test.columns,
+                 "Importance": perm.importances_mean,
+                 "Std": perm.importances_std}
+            )
+            .sort_values("Importance", ascending=False)
+            .reset_index(drop=True)
+        )
+
         results[name] = {
             "pipe": pipe,
             "accuracy": accuracy_score(y_test, pred),
@@ -88,6 +105,7 @@ def train_models(df):
             ).T,
             "cm": confusion_matrix(y_test, pred, labels=pipe.classes_),
             "classes": list(pipe.classes_),
+            "importance": importance,
             "n_train": len(X_train),
             "n_test": len(X_test),
         }
@@ -104,7 +122,7 @@ feature_cols = [c for c in df.columns if c != TARGET]
 st.sidebar.title("Navigation")
 option = st.sidebar.radio(
     "Go to",
-    ["Data Overview", "Visualizations", "Model Evaluation", "Predict Sleep Disorder"],
+    ["Data Overview", "Visualizations", "Model Evaluation", "Feature Importance", "Predict Sleep Disorder"],
 )
 
 # ===========================
@@ -181,7 +199,30 @@ elif option == "Model Evaluation":
             plt.close(fig)
 
 # ===========================
-# 4. Prediction
+# 4. Feature importance (explainability)
+# ===========================
+elif option == "Feature Importance":
+    st.title("Which inputs does the model rely on?")
+    st.caption(
+        "Permutation importance: how much the model's macro F1 on the test set drops "
+        "when one input is randomly shuffled. A bigger drop means the model leans on that "
+        "input more. These are explanations of the MODEL, not proof of medical causes, "
+        "and correlated inputs can share or hide each other's importance."
+    )
+    model_name_imp = st.selectbox("Model", list(results.keys()), key="imp_model")
+    imp = results[model_name_imp]["importance"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    plot_df = imp.sort_values("Importance")
+    ax.barh(plot_df["Feature"], plot_df["Importance"], xerr=plot_df["Std"])
+    ax.set_xlabel("Drop in macro F1 when shuffled")
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.dataframe(imp.style.format({"Importance": "{:.4f}", "Std": "{:.4f}"}))
+
+# ===========================
+# 5. Prediction
 # ===========================
 elif option == "Predict Sleep Disorder":
     st.title("Predict Sleep Disorder")
