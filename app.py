@@ -4,12 +4,13 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import streamlit as st
 
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.inspection import permutation_importance
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -25,6 +26,7 @@ CAT_COLS = ["Gender", "Occupation", "BMI Category"]
 @st.cache_data
 def load_data():
     df = pd.read_csv("data.csv")
+    raw_rows = len(df)
 
     # Blood pressure "120/80" -> two numeric columns
     bp = df["Blood Pressure"].str.split("/", expand=True).astype(int)
@@ -41,8 +43,9 @@ def load_data():
     # pandas can read the text "None" as a missing value; put it back as a real class
     df[TARGET] = df[TARGET].fillna("None").astype(str).str.strip()
 
+    # Identical rows (same inputs AND label) add no information and leak between train/test
     df = df.drop_duplicates().reset_index(drop=True)
-    return df
+    return df, raw_rows
 
 
 # ===========================
@@ -53,10 +56,15 @@ def train_models(df):
     X = df.drop(columns=[TARGET])
     y = df[TARGET]
 
-    # Held-out test set; stratified so every class appears in both parts
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
+    # Rows with identical inputs form one "profile". Keep each profile entirely in
+    # train OR test, so the test set never contains a profile the model has seen.
+    groups = pd.factorize(X.astype(str).agg("|".join, axis=1))[0]
+
+    # Hold-out split (~20%): first fold of a stratified, grouped 5-fold split
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    train_idx, test_idx = next(splitter.split(X, y, groups))
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
     num_cols = [c for c in X.columns if c not in CAT_COLS]
 
@@ -81,6 +89,16 @@ def train_models(df):
 
         pred = pipe.predict(X_test)
 
+        # Repeated grouped cross-validation: a steadier estimate than one small split
+        cv_acc, cv_f1 = [], []
+        for seed in range(5):
+            cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+            for tr, te in cv.split(X, y, groups):
+                m = clone(pipe).fit(X.iloc[tr], y.iloc[tr])
+                p = m.predict(X.iloc[te])
+                cv_acc.append(accuracy_score(y.iloc[te], p))
+                cv_f1.append(f1_score(y.iloc[te], p, average="macro"))
+
         # Permutation importance on the TEST set, per original input feature
         perm = permutation_importance(
             pipe, X_test, y_test, scoring="f1_macro",
@@ -104,6 +122,8 @@ def train_models(df):
                 classification_report(y_test, pred, output_dict=True, zero_division=0)
             ).T,
             "cm": confusion_matrix(y_test, pred, labels=pipe.classes_),
+            "cv_acc": (float(np.mean(cv_acc)), float(np.std(cv_acc))),
+            "cv_f1": (float(np.mean(cv_f1)), float(np.std(cv_f1))),
             "classes": list(pipe.classes_),
             "importance": importance,
             "n_train": len(X_train),
@@ -112,7 +132,7 @@ def train_models(df):
     return results
 
 
-df = load_data()
+df, raw_rows = load_data()
 results = train_models(df)
 feature_cols = [c for c in df.columns if c != TARGET]
 
@@ -134,6 +154,17 @@ if option == "Data Overview":
     st.write(df.describe())
     st.write("Sleep Disorder counts:")
     st.write(df[TARGET].value_counts())
+
+    feats = [c for c in df.columns if c != TARGET]
+    n_profiles = df.groupby(feats).ngroups
+    n_conflict = int((df.groupby(feats)[TARGET].nunique() > 1).sum())
+    st.subheader("Data notes")
+    st.write(
+        f"- Original file: {raw_rows} rows. After removing exact duplicate rows: {len(df)} rows.\n"
+        f"- Distinct input profiles: {n_profiles}. Of these, {n_conflict} appear with more than one "
+        "label, so some labels cannot be predicted from the inputs alone.\n"
+        "- Blank Sleep Disorder values in the source file are treated as the class 'None'."
+    )
 
 # ===========================
 # 2. Visualizations
@@ -166,10 +197,22 @@ elif option == "Model Evaluation":
     st.title("Model Evaluation")
     any_res = next(iter(results.values()))
     st.caption(
-        f"Stratified 80/20 split: {any_res['n_train']} training rows, "
-        f"{any_res['n_test']} test rows. All metrics are on the unseen test rows. "
+        "Rows with identical inputs are kept together (never split between train and test), "
+        "so models are always tested on profiles they have not seen. "
         "The dataset is small, so treat these numbers as indicative, not definitive."
     )
+
+    cv_table = pd.DataFrame(
+        {
+            name: {
+                "Accuracy (mean)": r["cv_acc"][0], "Accuracy (std)": r["cv_acc"][1],
+                "Macro F1 (mean)": r["cv_f1"][0], "Macro F1 (std)": r["cv_f1"][1],
+            }
+            for name, r in results.items()
+        }
+    ).T
+    st.subheader("Cross-validation (5 repeats x 5 grouped folds)")
+    st.dataframe(cv_table.style.format("{:.3f}"))
 
     summary = pd.DataFrame(
         {
@@ -177,7 +220,9 @@ elif option == "Model Evaluation":
             for name, r in results.items()
         }
     ).T
-    st.subheader("Model comparison")
+    st.subheader(
+        f"Single hold-out split ({any_res['n_train']} train / {any_res['n_test']} test rows)"
+    )
     st.dataframe(summary.style.format("{:.3f}"))
 
     for name, r in results.items():
@@ -231,7 +276,7 @@ elif option == "Predict Sleep Disorder":
         "If you are worried about your sleep, please talk to a doctor."
     )
 
-    best_default = max(results, key=lambda n: results[n]["macro_f1"])
+    best_default = max(results, key=lambda n: results[n]["cv_f1"][0])
     model_name = st.selectbox(
         "Model", list(results.keys()), index=list(results.keys()).index(best_default)
     )
