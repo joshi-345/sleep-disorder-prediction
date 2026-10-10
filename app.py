@@ -25,7 +25,8 @@ CAT_COLS = ["Gender", "Occupation", "BMI Category"]
 # ===========================
 @st.cache_data
 def load_data():
-    df = pd.read_csv("data.csv")
+    # "None" is a real class label in this file, so do not let pandas treat it as missing
+    df = pd.read_csv("data.csv", keep_default_na=False, na_values=[""])
     raw_rows = len(df)
 
     # Blood pressure "120/80" -> two numeric columns
@@ -40,8 +41,7 @@ def load_data():
 
     # Clean labels
     df["BMI Category"] = df["BMI Category"].astype(str).str.strip().replace({"Normal Weight": "Normal"})
-    # pandas can read the text "None" as a missing value; put it back as a real class
-    df[TARGET] = df[TARGET].fillna("None").astype(str).str.strip()
+    df[TARGET] = df[TARGET].astype(str).str.strip()
 
     # Identical rows (same inputs AND label) add no information and leak between train/test
     df = df.drop_duplicates().reset_index(drop=True)
@@ -65,6 +65,7 @@ def train_models(df):
     train_idx, test_idx = next(splitter.split(X, y, groups))
     X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
     y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    groups_train = groups[train_idx]
 
     num_cols = [c for c in X.columns if c not in CAT_COLS]
 
@@ -89,15 +90,16 @@ def train_models(df):
 
         pred = pipe.predict(X_test)
 
-        # Repeated grouped cross-validation: a steadier estimate than one small split
+        # Repeated grouped cross-validation on the TRAINING rows only.
+        # Used for choosing between models; the hold-out test rows are never touched here.
         cv_acc, cv_f1 = [], []
         for seed in range(5):
             cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
-            for tr, te in cv.split(X, y, groups):
-                m = clone(pipe).fit(X.iloc[tr], y.iloc[tr])
-                p = m.predict(X.iloc[te])
-                cv_acc.append(accuracy_score(y.iloc[te], p))
-                cv_f1.append(f1_score(y.iloc[te], p, average="macro"))
+            for tr, va in cv.split(X_train, y_train, groups_train):
+                m = clone(pipe).fit(X_train.iloc[tr], y_train.iloc[tr])
+                p = m.predict(X_train.iloc[va])
+                cv_acc.append(accuracy_score(y_train.iloc[va], p))
+                cv_f1.append(f1_score(y_train.iloc[va], p, average="macro"))
 
         # Permutation importance on the TEST set, per original input feature
         perm = permutation_importance(
@@ -142,7 +144,7 @@ feature_cols = [c for c in df.columns if c != TARGET]
 st.sidebar.title("Navigation")
 option = st.sidebar.radio(
     "Go to",
-    ["Data Overview", "Visualizations", "Model Evaluation", "Feature Importance", "Predict Sleep Disorder"],
+    ["Data Overview", "Visualizations", "Model Evaluation", "Feature Importance", "Explore the Model"],
 )
 
 # ===========================
@@ -163,7 +165,7 @@ if option == "Data Overview":
         f"- Original file: {raw_rows} rows. After removing exact duplicate rows: {len(df)} rows.\n"
         f"- Distinct input profiles: {n_profiles}. Of these, {n_conflict} appear with more than one "
         "label, so some labels cannot be predicted from the inputs alone.\n"
-        "- Blank Sleep Disorder values in the source file are treated as the class 'None'."
+        "- The Sleep Disorder label 'None' (no disorder) is a real class in the source file."
     )
 
 # ===========================
@@ -199,6 +201,8 @@ elif option == "Model Evaluation":
     st.caption(
         "Rows with identical inputs are kept together (never split between train and test), "
         "so models are always tested on profiles they have not seen. "
+        "Models are compared with cross-validation on the training rows only. "
+        "The hold-out test rows are used once, at the end, as a final check. "
         "The dataset is small, so treat these numbers as indicative, not definitive."
     )
 
@@ -211,7 +215,7 @@ elif option == "Model Evaluation":
             for name, r in results.items()
         }
     ).T
-    st.subheader("Cross-validation (5 repeats x 5 grouped folds)")
+    st.subheader("Model comparison: cross-validation on training rows (5 repeats x 5 grouped folds)")
     st.dataframe(cv_table.style.format("{:.3f}"))
 
     summary = pd.DataFrame(
@@ -221,7 +225,7 @@ elif option == "Model Evaluation":
         }
     ).T
     st.subheader(
-        f"Single hold-out split ({any_res['n_train']} train / {any_res['n_test']} test rows)"
+        f"Final hold-out test, used once ({any_res['n_train']} train / {any_res['n_test']} test rows)"
     )
     st.dataframe(summary.style.format("{:.3f}"))
 
@@ -269,8 +273,8 @@ elif option == "Feature Importance":
 # ===========================
 # 5. Prediction
 # ===========================
-elif option == "Predict Sleep Disorder":
-    st.title("Predict Sleep Disorder")
+elif option == "Explore the Model":
+    st.title("Explore a Sleep-Health Model")
     st.warning(
         "Educational demo only. This is not medical advice or a diagnosis. "
         "If you are worried about your sleep, please talk to a doctor."
@@ -320,7 +324,7 @@ elif option == "Predict Sleep Disorder":
     classes = list(pipe.classes_)
     pred_label = classes[int(np.argmax(proba))]
 
-    st.subheader("Prediction")
-    st.write(f"**Predicted class:** {pred_label}")
-    st.write("Class probabilities:")
+    st.subheader("Model output")
+    st.write(f"**Model's most likely class:** {pred_label}")
+    st.write("Model-estimated class probabilities (not a personal medical risk):")
     st.bar_chart(pd.Series(proba, index=classes, name="Probability"))
